@@ -1,0 +1,24 @@
+dependencies:
+  idf: ">=6.2"
+  esp-mosaico-bsp:
+    version: "*"
+    override_path: "../../../submodule/esp-mosaico-bsp/components/esp-mosaico-bsp"
+  esp_iris:
+    version: "*"
+    override_path: "../../../submodule/esp-mosaico-utils/ESP-Iris/components/esp_iris"
+  # esp-gsp 1.5.1 is no longer downloadable from the CDN (403); build from the
+  # verified local clone shared with weiqi-quest / poets_survival.
+  espressif/esp-gsp:
+    version: "==1.5.1"
+    override_path: "../../../weiqi-solution/dev/esp-gsp"
+  # The BSP display adapter uses headers deprecated by LVGL 9.6.
+  lvgl/lvgl: "==9.5.0"
+  # MP3 解码（esp_audio_simple_dec）：本地 vendored，只留 esp32s31 库（9MB）。
+  esp_audio_codec:
+    path: ../components/esp_audio_codec
+  # 发音缓存（NAND + LittleFS）。
+  espressif/spi_nand_flash: "^1.4.1"
+  joltwallet/esp_littlefs:
+    version: "*"
+    override_path: "../../../../esp_littlefs"
+  espressif/cjson: "^1.7.19"

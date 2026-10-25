@@ -1,0 +1,6 @@
+Required Notice: Copyright 2026 Samyeei (https://github.com/samyeei)
+
+word_teacher（《AI 单词老师》）是 samyeei/mosaico-learning-assistant 的衍生作品：
+应用骨架继承自 learning-assistant（PolyForm Noncommercial 1.0.0），词库内容与
+发音缓存方案来自 Leo 的 english-dict 项目（MIT）。第三方代码和字体保留原许可，
+见 THIRD_PARTY_NOTICES.md。上游 board_display 适配器为 Apache-2.0。
