@@ -10,6 +10,7 @@ enum { HTTP_METHOD_GET=0, HTTP_METHOD_POST };
 esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *config);
 esp_err_t esp_http_client_set_method(esp_http_client_handle_t client,int method);
 esp_err_t esp_http_client_set_header(esp_http_client_handle_t client,const char *key,const char *value);
+esp_err_t esp_http_client_set_url(esp_http_client_handle_t client,const char *url);
 esp_err_t esp_http_client_open(esp_http_client_handle_t client,int size);
 int esp_http_client_write(esp_http_client_handle_t client,const char *data,int size);
 int64_t esp_http_client_fetch_headers(esp_http_client_handle_t client);

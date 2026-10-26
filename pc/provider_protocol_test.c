@@ -32,6 +32,7 @@ esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *cf
 esp_err_t esp_http_client_set_method(esp_http_client_handle_t c,int method){(void)c;assert(method==HTTP_METHOD_POST||method==HTTP_METHOD_GET);return ESP_OK;}
 esp_err_t esp_http_client_set_header(esp_http_client_handle_t c,const char *key,const char *value)
 {if(!strcmp(key,"Authorization"))snprintf(c->auth,sizeof(c->auth),"%s",value);return ESP_OK;}
+esp_err_t esp_http_client_set_url(esp_http_client_handle_t c,const char *url){snprintf(c->url,sizeof(c->url),"%s",url);return ESP_OK;}
 esp_err_t esp_http_client_open(esp_http_client_handle_t c,int size){assert(size>=0);c->offset=0;c->complete=false;c->used=0;header_calls=0;uploads=0;
     if(!oss_response){c->response=response;c->status=status_code;}return open_result;}
 int esp_http_client_write(esp_http_client_handle_t c,const char *data,int size)

@@ -72,12 +72,15 @@ static esp_err_t exchange(wt_provider_handle_t p,const char *url,
 // 常驻 API 连接：家庭路由对设备侧新建 TLS 握手有随机丢弃（bad finished/
 // connect 超时），连接建立后的收发稳定。keep-alive 复用一条已握手连接，
 // 失败时销毁、下次调用重建。仅 worker 任务使用，无需加锁。
-static esp_http_client_handle_t api_client;
-static char api_client_url[192];
-static void api_client_drop(void)
+// 按主机保留的常驻连接槽位：DashScope API 与音频 OSS 各占一条，
+// 避免主机切换时销毁已握手的连接（本网络新建 TLS 握手失败率高）。
+#define API_CLIENT_SLOTS 3
+static esp_http_client_handle_t api_clients[API_CLIENT_SLOTS];
+static char api_client_hosts[API_CLIENT_SLOTS][96];
+static void api_client_drop_by_slot(int i)
 {
-    if(api_client){esp_http_client_close(api_client);esp_http_client_cleanup(api_client);api_client=NULL;}
-    api_client_url[0]=0;
+    if(api_clients[i]){esp_http_client_close(api_clients[i]);esp_http_client_cleanup(api_clients[i]);api_clients[i]=NULL;}
+    api_client_hosts[i][0]=0;
 }
 // 只取 https://host（不带路径）：同一主机即可复用连接。
 static void url_host(const char *url,char *out,size_t cap)
@@ -89,17 +92,19 @@ static void url_host(const char *url,char *out,size_t cap)
 }
 static esp_http_client_handle_t api_client_get(const char *url)
 {
-    // 主机不同（北京/新加坡、TTS 域名）则重建。
     char host[96];url_host(url,host,sizeof(host));
-    if(api_client&&strcmp(host,api_client_url)!=0)api_client_drop();
-    if(!api_client){
+    for(int i=0;i<API_CLIENT_SLOTS;++i)
+        if(api_clients[i]&&!strcmp(host,api_client_hosts[i]))
+            return api_clients[i];
+    for(int i=0;i<API_CLIENT_SLOTS;++i){
+        if(api_clients[i])continue;
         esp_http_client_config_t cfg={.url=url,.timeout_ms=8000,
             .crt_bundle_attach=esp_crt_bundle_attach,.buffer_size=2048,
             .disable_auto_redirect=true,.keep_alive_enable=true};
-        api_client=esp_http_client_init(&cfg);
-        char h[96];url_host(url,h,sizeof(h));snprintf(api_client_url,sizeof(api_client_url),"%s",h);
+        api_clients[i]=esp_http_client_init(&cfg);
+        if(api_clients[i]){snprintf(api_client_hosts[i],sizeof(api_client_hosts[i]),"%s",host);return api_clients[i];}
     }
-    return api_client;
+    return NULL;
 }
 static esp_err_t exchange_once(wt_provider_handle_t p,const char *url,
     const char *key,const char *body,uint8_t **out,size_t *bytes,size_t cap)
@@ -110,6 +115,9 @@ static esp_err_t exchange_once(wt_provider_handle_t p,const char *url,
     const char *stage="connect";
     esp_http_client_handle_t client=api_client_get(url);
     if(!client)return error(p,"网络请求内存不足",ESP_ERR_NO_MEM);
+    // 复用连接必须显式更新 URL（路径/查询随请求变化），否则会发到上一次的端点。
+    esp_err_t url_err=esp_http_client_set_url(client,url);
+    if(url_err!=ESP_OK)return error(p,"网络请求地址设置失败",url_err);
     esp_err_t err=ESP_OK;
     // 复用连接必须显式重置 method：上一次 POST 会残留到本次 GET 下载。
     err=esp_http_client_set_method(client,body?HTTP_METHOD_POST:HTTP_METHOD_GET);
@@ -169,7 +177,11 @@ static esp_err_t exchange_once(wt_provider_handle_t p,const char *url,
             stage,err,tls_err,tls_code,tls_flags,(unsigned)((esp_timer_get_time()-started)/1000));
         if(tls_code||tls_flags)error(p,"Wi-Fi 已连接，但模型安全连接失败，请重试",err);
     }
-    if(err!=ESP_OK){api_client_drop();free(buffer);if(!p->error[0])error(p,err==ESP_ERR_NO_MEM?"设备内存不足，请稍后重试":"网络超时或连接失败，请重试",err);return err;}
+    if(err!=ESP_OK){
+        char h[96];url_host(url,h,sizeof(h));
+        for(int i=0;i<API_CLIENT_SLOTS;++i)
+            if(api_clients[i]&&!strcmp(h,api_client_hosts[i]))api_client_drop_by_slot(i);
+        free(buffer);if(!p->error[0])error(p,err==ESP_ERR_NO_MEM?"设备内存不足，请稍后重试":"网络超时或连接失败，请重试",err);return err;}
     // 成功：连接保留复用（读完整响应后 esp_http_client 已回到可复用状态）。
     ESP_LOGI("wt_provider","Response complete: bytes=%u elapsed_ms=%u",
         (unsigned)used,(unsigned)((esp_timer_get_time()-started)/1000));
