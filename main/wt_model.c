@@ -307,7 +307,7 @@ bool wt_model_action(wt_model_handle_t m, wt_action_t action, wt_command_t *out)
         if(m->view.page!=WT_WORD)return false;
         if(!m->word_loaded||!m->view.sent_en[0]){hint(m,"这个词没有例句");break;}
         if(!m->view.online){hint(m,"第一次发音需要联网，请先连接网络");break;}
-        command(m,out,WT_CMD_SPEAK_SENT);snprintf(out->text,sizeof(out->text),"s:%s",m->view.sent_en);break;
+        command(m,out,WT_CMD_SPEAK_SENT);snprintf(out->text,sizeof(out->text),"%s",m->view.sent_en);break;
     case WT_TEACH: {
         if(m->view.page!=WT_WORD||!m->word_loaded)return false;
         if(!teacher_ready(m))break;

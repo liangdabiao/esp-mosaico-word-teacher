@@ -74,11 +74,11 @@ void app_main(void)
     ESP_ERROR_CHECK(iris_screen_mirror_attach(ui));
     ESP_ERROR_CHECK_WITHOUT_ABORT(app_orientation_start(ui));
     ESP_ERROR_CHECK(wt_controls_start(ui));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(wt_network_start());
-    // 启动晚期失败只降级（显示/教师/语音部分可用），绝不 abort——
-    // abort 会触发 bootloader 对 ota_0 的未确认回滚，设备跌回 factory。
+    // 音频（含 MP3 解码器）必须在 WiFi 之前初始化：WiFi 静态缓冲先占 ~50KB
+    // 内部 RAM 后，解码器就拿不到连续大块（真机发音 NO_MEM 的根因）。
     if (wt_runtime_start(ui) != ESP_OK)
         ESP_LOGE(TAG, "runtime degraded: voice/teacher partially unavailable");
+    ESP_ERROR_CHECK_WITHOUT_ABORT(wt_network_start());
     if (wt_ui_create(ui, &s_learning) != ESP_GSP_OK)
         ESP_LOGE(TAG, "UI create failed; screen mirror stays for recovery");
 

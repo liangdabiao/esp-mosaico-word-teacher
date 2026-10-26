@@ -125,6 +125,12 @@ int main(void){
     msg.kind=WT_MSG_STATUS;msg.generation=1;msg.online=true;msg.configured=true;msg.api_state=WT_API_READY;msg.streak=5;
     wt_model_message(m,&msg);
     assert(wt_model_action(m,WT_BOOK_0,&cmd));
+    wt_model_snapshot(m,&v);
+    assert(wt_model_action(m,WT_SPEAK_WORD,&cmd));
+    assert(cmd.kind==WT_CMD_SPEAK_WORD&&!strcmp(cmd.text,v.word));
+    assert(wt_model_action(m,WT_SPEAK_SENT,&cmd));
+    assert(cmd.kind==WT_CMD_SPEAK_SENT&&!strcmp(cmd.text,v.sent_en));
+    assert(strncmp(cmd.text,"s:",2));
     assert(wt_model_action(m,WT_OPEN_QUIZ,&cmd));
     wt_model_snapshot(m,&v);
     assert(v.page==WT_QUIZ&&v.quiz_ready&&v.quiz_prompt[0]);

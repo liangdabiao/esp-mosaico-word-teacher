@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 #include "wt_controls.h"
 wt_controls_t wt_controls_defaults(void)
-{return (wt_controls_t){.brightness=80,.volume=50,.speech_enabled=true,.automatic=true,.grade=WT_GRADE_DEFAULT};}
+{return (wt_controls_t){.brightness=80,.volume=80,.speech_enabled=true,.automatic=true,.grade=WT_GRADE_DEFAULT};}
 const char *wt_grade_name(unsigned grade)
 {
     static const char *const names[]={"一年级","二年级","三年级","四年级","五年级","六年级","初一","初二","初三","高一","高二","高三"};
