@@ -50,6 +50,7 @@ static void wifi_event(void *ctx, esp_event_base_t base, int32_t id, void *data)
         if(s->configured&&!atomic_load(&s->saving)&&s->reconnects++<5)esp_wifi_connect();
     }
 }
+static void wifi_bringup_task(void *ctx);
 static esp_err_t join(struct network_t *s, const wt_config_t *c)
 {
     atomic_store(&s->online, false); esp_wifi_disconnect();
@@ -243,11 +244,12 @@ esp_err_t wt_network_start(void)
     err=esp_event_handler_instance_register(IP_EVENT,IP_EVENT_STA_GOT_IP,wifi_event,s,&s->ip_event);if(err!=ESP_OK)goto fail;
     err=esp_wifi_set_storage(WIFI_STORAGE_RAM);if(err!=ESP_OK)goto fail;
     err=esp_wifi_set_mode(WIFI_MODE_STA);if(err!=ESP_OK)goto fail;
-    err=esp_wifi_start();if(err!=ESP_OK)goto fail;
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);esp_sntp_setservername(0,"ntp.aliyun.com");esp_sntp_init();
     net=s;result(s,"填写 Wi-Fi 和 Qwen API Key 后测试连接");
-    if(s->configured)return join(s,&s->config);
-    return wt_network_setup();
+    // esp_wifi_start 的 ~30s 射频校准不能同步做（饿死渲染任务→看门狗复位），
+    // 也不放 worker（深调用栈溢出）；独立任务拉起后自删。
+    if(xTaskCreate(wifi_bringup_task,"wt_netup",8192,s,4,NULL)!=pdPASS)return ESP_ERR_NO_MEM;
+    return ESP_OK;
 fail:
     // No other app owns this process' Wi-Fi. Roll back registered callbacks
     // before freeing context; default loop itself is a shared SDK service.
@@ -256,6 +258,16 @@ fail:
     esp_wifi_stop();esp_wifi_deinit();
     if(s->sta)esp_netif_destroy_default_wifi(s->sta);
     vSemaphoreDelete(s->lock);memset(s,0,sizeof(*s));free(s);return err;
+}
+// worker 任务调用：把已配置的 STA 连接真正拉起（阻塞发生在 worker，安全）。
+static void wifi_bringup_task(void *ctx)
+{
+    struct network_t *s=ctx;
+    if(esp_wifi_start()==ESP_OK){
+        if(s->configured)join(s,&s->config);
+        else wt_network_setup();
+    }else result(s,"Wi-Fi 启动失败，请在设置中重试");
+    vTaskDelete(NULL);
 }
 bool wt_network_online(void){return net&&atomic_load(&net->online);}
 bool wt_network_configured(void){return net&&net->configured;}

@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "wt_progress.h"
 
 enum { WT_TEXT_CAP = 8192, WT_LINE_CAP = 97, WT_LINES = 6,
        WT_VOICE_TEXT_CAP = 1024, WT_MAX_PAGES = 128, WT_MAX_RECORD_MS = 30000,
@@ -35,6 +36,7 @@ typedef enum { WT_MSG_ANSWER, WT_MSG_TRANSCRIPT,
     WT_MSG_ERROR, WT_MSG_SPEECH_DONE, WT_MSG_STATUS, WT_MSG_SETUP } wt_message_kind_t;
 typedef struct { wt_message_kind_t kind; uint32_t generation;
     bool online, configured, speaking; wt_api_state_t api_state;
+    unsigned streak;
     char text[WT_TEXT_CAP]; } wt_message_t;
 typedef struct { wt_page_t page; uint32_t generation, revision;
     bool online, configured, muted, recording, speaking;
@@ -72,3 +74,11 @@ void wt_model_message(wt_model_handle_t model, const wt_message_t *message);
 bool wt_model_tick(wt_model_handle_t model, unsigned elapsed_ms,
                          wt_command_t *command);
 void wt_model_snapshot(wt_model_handle_t model, wt_snapshot_t *snapshot);
+// 进度保存消息：单本位图（最大 567B）+ 可选断点。UI 拷贝→worker 写 NVS，
+// 渲染线程永不碰 flash（NVS 擦写在渲染任务里会触发看门狗死机）。
+typedef struct {
+    unsigned book_slot; uint32_t word_count; char book_key[12];
+    uint8_t bits[568];
+    bool resume_save; wt_resume_t resume;
+} wt_save_msg_t;
+bool wt_model_take_pending(wt_model_handle_t model, wt_save_msg_t *out);

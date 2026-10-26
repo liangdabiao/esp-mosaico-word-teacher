@@ -28,21 +28,35 @@ enum {
     kInputSize = 2048, kOutputSize = 16384, kResampleSize = 49152,
     kPlaybackRate = 48000,
 };
-static const char kWordUrlUs[] = "http://dict.youdao.com/dictvoice?type=0&audio=";
-static const char kWordUrlUk[] = "http://dict.youdao.com/dictvoice?type=1&audio=";
-static const char kSentenceUrl[] = "http://dict.youdao.com/dictvoice?type=2&audio=";
+static const char kWordUrlUs[] = "https://dict.youdao.com/dictvoice?type=0&audio=";
+static const char kWordUrlUk[] = "https://dict.youdao.com/dictvoice?type=1&audio=";
+static const char kSentenceUrl[] = "https://dict.youdao.com/dictvoice?type=2&audio=";
 struct wt_voice_t {
     esp_codec_dev_handle_t codec;
     bool codec_open;
     int applied_volume;
     uint8_t *input, *output, *resample;
     uint32_t generation;
+    // MP3 解码器开机常驻：运行中期内部堆碎片化后再 open 会 NO_MEM。
+    esp_audio_simple_dec_handle_t decoder;
 };
 static struct wt_voice_t voice;
 static bool still_current(uint32_t generation)
 { return voice.generation == generation; }
 static uint32_t now_ms(void)
 { return (uint32_t)(esp_timer_get_time() / 1000); }
+static esp_audio_simple_dec_handle_t open_mp3_decoder(void)
+{
+    if (voice.decoder) return voice.decoder;
+    esp_audio_simple_dec_cfg_t config = {
+        .dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_MP3,
+        .dec_cfg = NULL, .cfg_size = 0, .use_frame_dec = false};
+    if (esp_audio_simple_dec_open(&config, &voice.decoder) != ESP_AUDIO_ERR_OK) {
+        voice.decoder = NULL;
+        ESP_LOGE(kTag, "MP3 解码器打开失败");
+    }
+    return voice.decoder;
+}
 esp_err_t wt_voice_start(void)
 {
     if (voice.codec_open) return ESP_OK;
@@ -61,6 +75,8 @@ esp_err_t wt_voice_start(void)
         return ESP_FAIL;
     voice.applied_volume = (int)controls.volume;
     voice.codec_open = true;
+    // 启动早期（堆未碎片化）打开 MP3 解码器并常驻。
+    if (!open_mp3_decoder())ESP_LOGW(kTag, "发音解码器不可用，稍后重试打开");
     return ESP_OK;
 }
 void wt_voice_set_generation(uint32_t generation)
@@ -136,18 +152,6 @@ esp_err_t wt_voice_build_url(bool sentence, const char *text, char *out, size_t 
     return n < 0 || (size_t)n >= cap ? ESP_ERR_INVALID_SIZE : ESP_OK;
 }
 struct outcome { bool ok, cancelled; uint32_t bytes, pcm_bytes; const char *detail; };
-static esp_audio_simple_dec_handle_t open_mp3_decoder(void)
-{
-    esp_audio_simple_dec_cfg_t config = {
-        .dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_MP3,
-        .dec_cfg = NULL, .cfg_size = 0, .use_frame_dec = false};
-    esp_audio_simple_dec_handle_t decoder = NULL;
-    if (esp_audio_simple_dec_open(&config, &decoder) != ESP_AUDIO_ERR_OK) {
-        ESP_LOGE(kTag, "MP3 解码器打开失败");
-        return NULL;
-    }
-    return decoder;
-}
 // 主循环：读 → 剥 ID3 → 解码 → 混单声道 → 升采 → 写 I2S，边播边喂缓存 writer。
 // cache_source 非空 = 缓存回放（client 为 NULL）；否则走网络。
 static struct outcome stream_and_play(esp_http_client_handle_t client,
@@ -311,7 +315,8 @@ static struct outcome stream_and_play(esp_http_client_handle_t client,
     o.ok = true; o.detail = "ok"; return o;
 }
 // 缓存命中走文件；未命中走网络并边播边写缓存。整段成功才提交缓存。
-static esp_err_t play_key(const char *key, const char *url)
+// 单次尝试；play_key 负责弱网重试。
+static esp_err_t play_key_once(const char *key, const char *url)
 {
     esp_http_client_handle_t client = NULL;
     esp_audio_simple_dec_handle_t decoder = open_mp3_decoder();
@@ -365,6 +370,16 @@ static esp_err_t play_key(const char *key, const char *url)
     ESP_LOGI(kTag, "播放完成: ok=%u bytes=%u pcm=%u detail=%s",
         o.ok, o.bytes, o.pcm_bytes, o.detail);
     return o.ok || o.cancelled ? ESP_OK : ESP_FAIL;
+}
+// 弱网（读超时/连接抖动）自动重试一次；GET 下载体积小，重发无害。
+static esp_err_t play_key(const char *key, const char *url)
+{
+    esp_err_t err = play_key_once(key, url);
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "发音重试一次");
+        err = play_key_once(key, url);
+    }
+    return err;
 }
 esp_err_t wt_voice_speak_word(const char *word)
 {

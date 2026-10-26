@@ -15,3 +15,11 @@ CONFIG_ESP_WIFI_RX_BA_WIN=6
 
 # 发音缓存：SPI NAND 分层块设备 API（spi_nand_flash_init_with_layers）。
 CONFIG_NAND_FLASH_ENABLE_BDL=y
+
+# 发音缓存（/nand LittleFS）：BDL 报 block/read/prog=2048，cache<2048 直接
+# ESP_ERR_INVALID_ARG（known-issues #16 坑 D）；对齐出厂 Recovery 的 4096。
+# LittleFS 工作缓冲放 PSRAM（省内部 RAM ~40KB），仅 array_cache 留内部。
+CONFIG_LITTLEFS_MALLOC_STRATEGY_SPIRAM=y
+CONFIG_LITTLEFS_CACHE_SIZE=4096
+CONFIG_LITTLEFS_USE_MTIME=y
+CONFIG_LITTLEFS_OBJ_NAME_LEN=255

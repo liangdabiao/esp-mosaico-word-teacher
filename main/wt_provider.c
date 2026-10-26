@@ -5,6 +5,14 @@
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "esp_timer.h"
+#ifdef ESP_PLATFORM
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#else
+#include <windows.h>   // 宿主测试桩：Sleep 代替 vTaskDelay
+#define vTaskDelay(t) Sleep(1)
+#define pdMS_TO_TICKS(x) (x)
+#endif
 #include "mbedtls/base64.h"
 #include "cJSON.h"
 #include "esp_log.h"
@@ -45,20 +53,66 @@ static esp_err_t status_error(wt_provider_handle_t p)
         p->status>=500?"模型服务暂时不可用，请稍后重试":"模型请求未成功，请检查配置";
     return error(p,s,ESP_FAIL);
 }
+static esp_err_t exchange_once(wt_provider_handle_t p,const char *url,
+    const char *key,const char *body,uint8_t **out,size_t *bytes,size_t cap);
+
+// 弱 WiFi/射频拥挤下 TLS 握手与上传都可能被打断；同一请求自动重试一次。
+// 只重试"未收到服务器响应"的失败（connect/handshake/upload），响应阶段不重发。
 static esp_err_t exchange(wt_provider_handle_t p,const char *url,
+    const char *key,const char *body,uint8_t **out,size_t *bytes,size_t cap)
+{
+    esp_err_t err=exchange_once(p,url,key,body,out,bytes,cap);
+    if(err!=ESP_OK&&*out==NULL&&p->status==0&&current(p)){
+        ESP_LOGW("wt_provider","Transport retry once: err=%d",err);
+        vTaskDelay(pdMS_TO_TICKS(2500));
+        err=exchange_once(p,url,key,body,out,bytes,cap);
+    }
+    return err;
+}
+// 常驻 API 连接：家庭路由对设备侧新建 TLS 握手有随机丢弃（bad finished/
+// connect 超时），连接建立后的收发稳定。keep-alive 复用一条已握手连接，
+// 失败时销毁、下次调用重建。仅 worker 任务使用，无需加锁。
+static esp_http_client_handle_t api_client;
+static char api_client_url[192];
+static void api_client_drop(void)
+{
+    if(api_client){esp_http_client_close(api_client);esp_http_client_cleanup(api_client);api_client=NULL;}
+    api_client_url[0]=0;
+}
+// 只取 https://host（不带路径）：同一主机即可复用连接。
+static void url_host(const char *url,char *out,size_t cap)
+{
+    const char *p=strstr(url,"://");p=p?p+3:url;
+    const char *end=strchr(p,'/');size_t n=end?(size_t)(end-p):strlen(p);
+    if(n>=cap)n=cap-1;
+    memcpy(out,p,n);out[n]=0;
+}
+static esp_http_client_handle_t api_client_get(const char *url)
+{
+    // 主机不同（北京/新加坡、TTS 域名）则重建。
+    char host[96];url_host(url,host,sizeof(host));
+    if(api_client&&strcmp(host,api_client_url)!=0)api_client_drop();
+    if(!api_client){
+        esp_http_client_config_t cfg={.url=url,.timeout_ms=8000,
+            .crt_bundle_attach=esp_crt_bundle_attach,.buffer_size=2048,
+            .disable_auto_redirect=true,.keep_alive_enable=true};
+        api_client=esp_http_client_init(&cfg);
+        char h[96];url_host(url,h,sizeof(h));snprintf(api_client_url,sizeof(api_client_url),"%s",h);
+    }
+    return api_client;
+}
+static esp_err_t exchange_once(wt_provider_handle_t p,const char *url,
     const char *key,const char *body,uint8_t **out,size_t *bytes,size_t cap)
 {
     *out=NULL;*bytes=0;p->error[0]=0;p->status=0;
     if(!current(p))return ESP_ERR_INVALID_STATE;
     int64_t started=esp_timer_get_time(),deadline=started+TOTAL_TIMEOUT_US;
     const char *stage="connect";
-    esp_http_client_config_t cfg={.url=url,.timeout_ms=HTTP_TIMEOUT_MS,
-        .crt_bundle_attach=esp_crt_bundle_attach,.buffer_size=2048,
-        .disable_auto_redirect=true,.keep_alive_enable=false};
-    esp_http_client_handle_t client=esp_http_client_init(&cfg);
+    esp_http_client_handle_t client=api_client_get(url);
     if(!client)return error(p,"网络请求内存不足",ESP_ERR_NO_MEM);
     esp_err_t err=ESP_OK;
-    if(body)err=esp_http_client_set_method(client,HTTP_METHOD_POST);
+    // 复用连接必须显式重置 method：上一次 POST 会残留到本次 GET 下载。
+    err=esp_http_client_set_method(client,body?HTTP_METHOD_POST:HTTP_METHOD_GET);
     if(err==ESP_OK&&body)err=esp_http_client_set_header(client,"Content-Type","application/json");
     if(err==ESP_OK&&key){
         char *auth=malloc(strlen(key)+8);
@@ -115,8 +169,8 @@ static esp_err_t exchange(wt_provider_handle_t p,const char *url,
             stage,err,tls_err,tls_code,tls_flags,(unsigned)((esp_timer_get_time()-started)/1000));
         if(tls_code||tls_flags)error(p,"Wi-Fi 已连接，但模型安全连接失败，请重试",err);
     }
-    esp_http_client_close(client);esp_http_client_cleanup(client);
-    if(err!=ESP_OK){free(buffer);if(!p->error[0])error(p,err==ESP_ERR_NO_MEM?"设备内存不足，请稍后重试":"网络超时或连接失败，请重试",err);return err;}
+    if(err!=ESP_OK){api_client_drop();free(buffer);if(!p->error[0])error(p,err==ESP_ERR_NO_MEM?"设备内存不足，请稍后重试":"网络超时或连接失败，请重试",err);return err;}
+    // 成功：连接保留复用（读完整响应后 esp_http_client 已回到可复用状态）。
     ESP_LOGI("wt_provider","Response complete: bytes=%u elapsed_ms=%u",
         (unsigned)used,(unsigned)((esp_timer_get_time()-started)/1000));
     buffer[used]=0;*out=buffer;*bytes=used;return ESP_OK;

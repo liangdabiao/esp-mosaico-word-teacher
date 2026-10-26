@@ -5,7 +5,7 @@
 typedef struct fake_http_t *esp_http_client_handle_t;
 typedef struct { const char *url;int timeout_ms;void *crt_bundle_attach;int buffer_size;
     bool disable_auto_redirect,keep_alive_enable; } esp_http_client_config_t;
-enum { HTTP_METHOD_POST };
+enum { HTTP_METHOD_GET=0, HTTP_METHOD_POST };
 #define ESP_ERR_HTTP_EAGAIN 0x7007
 esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *config);
 esp_err_t esp_http_client_set_method(esp_http_client_handle_t client,int method);

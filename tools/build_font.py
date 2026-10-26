@@ -21,6 +21,14 @@ from fontTools import subset
 from fontTools.ttLib import TTFont
 
 RUNTIME_CHARS = "0123456789/%.·:：()-—+×÷=<>‹›%% " + "已掌握学习个词天连续进度清空确认取消正确错误答案发音例句老师问页共未标记记住换种方式再来一次联网需要热点配置模型密钥网络连接失败请稍后重试成功保存重启设备正在识别语音讲解选择本书开始是否重点两次真正全部清空回到首页词库可用加载"
+# IPA 音标与补充符号：词典 blob 的池里包含 ˈkænsl 这类字符串，但为防上游
+# 字体与子集流程漏字符，这里显式列出全部 IPA 扩展（含重音/长短音/鼻化）。
+IPA_CHARS = ("ˈˌːˑəɚɛɜɝɪʊʌɒʒʃŋçθðæɑɔ˞ʳʲⁿ¡¿"
+             "ĀāĂăĄąĆćĈĉĊċČčĎďĐđĒēĔĕĖėĘęĚěĜĝĞğĠġĢģĤĥĦħĨĩĪīĬĭĮįİıĲĳĴĵĶķ"
+             "ĹĺĻļĽľŁłŃńŅņŇňŌōŎŏŐőŒœŔŕŖŗŘřŚśŜŝŞşŠšŢţŤťŦŧŨũŪūŬŭŮůŰűŲų"
+             "ŴŵŸÝŷŹźŻżŽž")
+# 词库池可能出现的希腊字母（部分音标借用）
+GREEK = "αβγδεθλμσφχψω"
 CJK_START = 0x2E80
 BLOB_PATH = Path(__file__).resolve().parent.parent / "assets/content/wt_content.bin"
 
@@ -55,6 +63,7 @@ def main() -> int:
     chars = set(RUNTIME_CHARS) | set(string.printable)
     chars |= gb2312_level1_chars() | set(CHAT_PUNCT)
     chars |= set(blob_pool_text(data))
+    chars |= set(IPA_CHARS) | set(GREEK)
     scene = json.loads((repo / "ui/main.json").read_text(encoding="utf-8"))
     chars |= set(json.dumps(scene, ensure_ascii=False))
     chars = {c for c in chars if c.isprintable() and c != "\ufffd"}

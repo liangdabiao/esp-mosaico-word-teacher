@@ -327,13 +327,14 @@ static void tick(esp_gsp_handle_t ui, void *ctx)
     if (key != s->key) { s->key = key; action(s, key ? WT_KEY_DOWN : WT_KEY_UP); }
     if (wt_model_tick(s->model, TICK_MS, &s->command)) submit(s);
     for (unsigned i = 0; i < 4 && wt_platform_poll(&s->message); ++i) {
+        // 回答直接以文字呈现；朗读仅由用户手动点击触发（按需求去掉自动 TTS）。
         wt_model_message(s->model, &s->message);
-        if(s->message.kind==WT_MSG_ANSWER){
-            wt_model_snapshot(s->model,&s->view);
-            if(s->message.generation==s->view.generation&&s->view.page==WT_READING&&!s->view.muted)action(s,WT_READ);
-        }
     }
     wt_model_snapshot(s->model, &s->view);
+    {   // 脏进度交 worker 落盘（渲染线程不碰 flash）
+        wt_save_msg_t sv;
+        while(wt_model_take_pending(s->model,&sv))wt_platform_progress_submit(&sv);
+    }
     if (!s->rendered || previous != s->view.revision) { render(s); s->rendered = true; }
     wt_platform_controls_get(&controls);render_controls(s,&controls);
     animate_recording(s);

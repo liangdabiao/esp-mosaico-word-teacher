@@ -31,7 +31,7 @@ enum { RATE=16000, SAMPLE_BYTES=2, AUDIO_CHUNK=512,
        WAV_HEADER=44, AUDIO_CAP=RATE*SAMPLE_BYTES*30,
        COMMAND_DEPTH=8, MESSAGE_DEPTH=4, WORKER_STACK=8192 };
 struct runtime_t {
-    QueueHandle_t commands,messages;
+    QueueHandle_t commands,messages,saves;
     SemaphoreHandle_t audio_lock;
     wt_provider_handle_t provider;
     wt_conversation_handle_t conversation;
@@ -80,15 +80,24 @@ static void header(struct runtime_t *r)
     put32(p+16,16);put16(p+20,1);put16(p+22,1);put32(p+24,RATE);
     put32(p+28,RATE*2);put16(p+32,2);put16(p+34,16);memcpy(p+36,"data",4);put32(p+40,(uint32_t)r->recorded);
 }
+// 麦克风与扬声器共用配对 I2S，必须同采样率：两者都开 48k，这里 3:1 抽取成
+// 16k 给 ASR（ES8311 16k 直播失真，48k 是扬声器唯一健康通路）。
+#define MIC_DECIMATE 3
 static void capture(void *ctx)
 {
     struct runtime_t *r=ctx;ulTaskNotifyTake(pdTRUE,portMAX_DELAY);
+    static int16_t raw[MIC_DECIMATE*AUDIO_CHUNK/2];
     for(;;){
         if(!r->mic_open){vTaskDelay(pdMS_TO_TICKS(100));continue;}
         uint32_t gen=atomic_load(&r->generation);bool rec=atomic_load(&r->recording);
-        int err=esp_codec_dev_read(r->mic,r->samples,sizeof(r->samples));
+        int err=esp_codec_dev_read(r->mic,raw,sizeof(raw));
         if(err!=ESP_CODEC_DEV_OK){if(rec)atomic_store(&r->overflow,true);vTaskDelay(pdMS_TO_TICKS(20));continue;}
         if(!rec||(int32_t)((uint32_t)(esp_timer_get_time()/1000)-atomic_load(&r->record_after_ms))<0)continue;
+        for(unsigned i=0;i<AUDIO_CHUNK/2;++i){
+            int32_t sum=0;
+            for(unsigned k=0;k<MIC_DECIMATE;++k)sum+=raw[i*MIC_DECIMATE+k];
+            r->samples[i]=(int16_t)(sum/MIC_DECIMATE);
+        }
         xSemaphoreTake(r->audio_lock,portMAX_DELAY);
         if(atomic_load(&r->recording)&&current(r,gen)){
             if(r->recorded+sizeof(r->samples)>AUDIO_CAP)atomic_store(&r->overflow,true);
@@ -151,6 +160,9 @@ static void network_status(struct runtime_t *r,bool force)
     r->last_online=online;r->last_configured=configured;r->last_api_state=r->api_state;
     memset(&r->message,0,sizeof(r->message));r->message.kind=WT_MSG_STATUS;
     r->message.online=online;r->message.configured=configured;r->message.api_state=r->api_state;
+    // streak 的 NVS 打卡在 worker 任务做一次，随状态消息带给模型；
+    // UI 任务（12KB 渲染栈）不碰 flash。
+    r->message.streak=wt_platform_streak_touch();
     if(!online)snprintf(r->message.text,sizeof(r->message.text),"%s",configured?"网络未连接，可在设置中重新配置":"请先用手机配置 Wi-Fi 和模型");
     xQueueSend(r->messages,&r->message,pdMS_TO_TICKS(100));
 }
@@ -189,8 +201,14 @@ static void answer_question(struct runtime_t *r,const wt_command_t *c,
 static void worker(void *ctx)
 {
     struct runtime_t *r=ctx;ulTaskNotifyTake(pdTRUE,portMAX_DELAY);network_status(r,true);setup_message(r,1);
+    unsigned heap_ticks=0;
     for(;;){
         network_status(r,false);
+        wt_save_msg_t save;
+        while(xQueueReceive(r->saves,&save,0)==pdTRUE){
+            if(save.resume_save)wt_platform_resume_save(&save.resume);
+            if(save.book_key[0])wt_platform_progress_save(save.book_key,save.bits,save.word_count);
+        }
         if(xQueueReceive(r->commands,&r->command,pdMS_TO_TICKS(200))!=pdTRUE)continue;
         wt_command_t *c=&r->command;
         if(!current(r,c->generation))continue;
@@ -242,13 +260,15 @@ static void worker(void *ctx)
 static void key_changed(void *button,void *ctx)
 {struct runtime_t *r=ctx;atomic_store(&r->key,iot_button_get_event(button)==BUTTON_PRESS_DOWN);}
 bool wt_platform_simulated(void){return false;}
-void wt_platform_presented(const wt_snapshot_t *snapshot)
-{if(runtime&&snapshot)atomic_store(&runtime->visible_page,snapshot->page);}
+void wt_platform_presented(const void *snapshot)
+{const wt_snapshot_t *v=(const wt_snapshot_t *)snapshot;
+ if(runtime&&v)atomic_store(&runtime->visible_page,v->page);}
 bool wt_platform_key(void){return runtime&&atomic_load(&runtime->key);}
-bool wt_platform_poll(wt_message_t *out)
+bool wt_platform_poll(void *out)
 {return runtime&&xQueueReceive(runtime->messages,out,0)==pdTRUE;}
-bool wt_platform_submit(const wt_command_t *c)
+bool wt_platform_submit(const void *command)
 {
+    const wt_command_t *c=(const wt_command_t *)command;
     struct runtime_t *r=runtime;if(!r||!atomic_load(&r->ready))return false;
     if(c->generation<atomic_load(&r->generation))return true;
     if(c->kind==WT_CMD_MUTE){
@@ -277,7 +297,7 @@ bool wt_platform_submit(const wt_command_t *c)
 // ---- 平台钩子的设备实现：词库 blob、进度 NVS、打卡 ----
 static wt_blob_t s_blob;
 static bool s_blob_ready;
-const wt_blob_t *wt_platform_content(void)
+const void *wt_platform_content(void)
 {
     if(!s_blob_ready){
         char reason[128];
@@ -297,19 +317,23 @@ bool wt_platform_progress_save(const char *book_key,const uint8_t *bits,uint32_t
     if(!book_key||!bits||!word_count)return false;
     return wt_store_save_bitmap(book_key,bits,word_count);
 }
-bool wt_platform_resume_load(const wt_blob_t *blob,wt_resume_t *out)
+bool wt_platform_resume_load(const void *blob,void *out)
 {
     if(!blob||!out)return false;
-    memset(out,0,sizeof(*out));
-    return wt_store_load_resume(blob,out)==WT_RESUME_OK;
+    memset(out,0,sizeof(wt_resume_t));
+    return wt_store_load_resume((const wt_blob_t *)blob,(wt_resume_t *)out)==WT_RESUME_OK;
 }
-void wt_platform_resume_save(const wt_resume_t *resume)
+void wt_platform_resume_save(const void *resume)
 {
-    if(resume)wt_store_save_resume(resume);
+    if(resume)wt_store_save_resume((const wt_resume_t *)resume);
 }
 unsigned wt_platform_streak_touch(void)
 {
     return wt_store_touch_streak();
+}
+void wt_platform_progress_submit(const void *save)
+{
+    if(runtime&&save&&runtime->saves)xQueueSend(runtime->saves,save,0);
 }
 esp_err_t wt_runtime_start(esp_gsp_handle_t ui)
 {
@@ -321,24 +345,29 @@ esp_err_t wt_runtime_start(esp_gsp_handle_t ui)
     atomic_init(&r->record_after_ms,0);
     atomic_init(&r->visible_page,WT_SETTINGS);
     r->commands=xQueueCreate(COMMAND_DEPTH,sizeof(wt_command_t));
-    r->messages=xQueueCreate(MESSAGE_DEPTH,sizeof(wt_message_t));r->audio_lock=xSemaphoreCreateMutex();
+    r->messages=xQueueCreate(MESSAGE_DEPTH,sizeof(wt_message_t));
+    r->saves=xQueueCreate(4,sizeof(wt_save_msg_t));r->audio_lock=xSemaphoreCreateMutex();
     r->wav=heap_caps_malloc(AUDIO_CAP+WAV_HEADER,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
     esp_err_t err=ESP_ERR_NO_MEM;
-    if(!r->commands||!r->messages||!r->audio_lock||!r->wav)goto fail;
+    if(!r->commands||!r->messages||!r->saves||!r->audio_lock||!r->wav)goto fail;
     err=wt_provider_create(current,r,&r->provider);if(err!=ESP_OK)goto fail;
     err=wt_conversation_create(&r->conversation);if(err!=ESP_OK)goto fail;
     r->mic=bsp_audio_codec_microphone_init();
-    esp_codec_dev_sample_info_t format={.sample_rate=RATE,.bits_per_sample=16,.channel=1};
+    esp_codec_dev_sample_info_t format={.sample_rate=48000,.bits_per_sample=16,.channel=1};
     if(r->mic&&esp_codec_dev_open(r->mic,&format)==ESP_CODEC_DEV_OK){
         r->mic_open=true;
         if(esp_codec_dev_set_in_gain(r->mic,24.0f)!=ESP_CODEC_DEV_OK){esp_codec_dev_close(r->mic);r->mic_open=false;}}
     // 发音通路（NAND 缓存 + 48kHz 扬声器）；失败只降级，不阻断启动。
+    if(!wt_cache_init())ESP_LOGW("wt_cache","发音缓存不可用（在线发音不受影响）");
     if(wt_voice_start()!=ESP_OK)ESP_LOGW("wt_voice","发音通路不可用（仅影响单词/例句发音）");
     const wt_blob_t *blob=wt_platform_content();
     if(!wt_store_init(blob?blob->version:0))ESP_LOGW("word_teacher","进度存储不可用（NVS），学习进度不会保存");
-    int count=0;err=bsp_iot_button_create(r->buttons,&count,BSP_BUTTON_NUM);if(err!=ESP_OK)goto fail;
-    err=iot_button_register_cb(r->buttons[BSP_BUTTON_AI],BUTTON_PRESS_DOWN,NULL,key_changed,r);if(err!=ESP_OK)goto fail;
-    err=iot_button_register_cb(r->buttons[BSP_BUTTON_AI],BUTTON_PRESS_UP,NULL,key_changed,r);if(err!=ESP_OK)goto fail;
+    int count=0;err=bsp_iot_button_create(r->buttons,&count,BSP_BUTTON_NUM);
+    if(err!=ESP_OK)ESP_LOGW("word_teacher","AI 键初始化失败(%s)，语音键不可用，触摸照常",esp_err_to_name(err));
+    else if(iot_button_register_cb(r->buttons[BSP_BUTTON_AI],BUTTON_PRESS_DOWN,NULL,key_changed,r)!=ESP_OK||
+            iot_button_register_cb(r->buttons[BSP_BUTTON_AI],BUTTON_PRESS_UP,NULL,key_changed,r)!=ESP_OK)
+        ESP_LOGW("word_teacher","AI 键回调注册失败，语音键不可用");
+    err=ESP_OK;
     if(xTaskCreate(capture,"wt_mic",4096,r,5,&r->capture_task)!=pdPASS){err=ESP_ERR_NO_MEM;goto fail;}
     if(xTaskCreate(worker,"wt_worker",WORKER_STACK,r,4,&r->worker_task)!=pdPASS){err=ESP_ERR_NO_MEM;goto fail;}
     runtime=r;atomic_store(&r->ready,true);xTaskNotifyGive(r->capture_task);xTaskNotifyGive(r->worker_task);return ESP_OK;
@@ -351,6 +380,7 @@ fail:
     wt_conversation_delete(r->conversation);
     if(r->commands)vQueueDelete(r->commands);
     if(r->messages)vQueueDelete(r->messages);
+    if(r->saves)vQueueDelete(r->saves);
     if(r->audio_lock)vSemaphoreDelete(r->audio_lock);
     free(r->wav);free(r);return err;
 }

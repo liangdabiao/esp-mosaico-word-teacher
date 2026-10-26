@@ -53,6 +53,24 @@ static esp_err_t release_control_pin(gpio_num_t pin)
     if (err != ESP_OK) return err;
     return gpio_set_level(pin, 1);
 }
+// 挂载失败也要释放已分配的 SPI 设备/总线/磨损均衡块设备，否则这些内部
+// RAM 永久泄漏（english-dict wd_cache 的 nand_cleanup_partial 同款）。
+static void nand_cleanup_partial(void)
+{
+    if (s_blockdev) {
+        s_blockdev->ops->release(s_blockdev);
+        s_blockdev = NULL;
+    }
+    if (s_device_added && s_spi) {
+        (void)spi_bus_remove_device(s_spi);
+    }
+    s_spi = NULL;
+    s_device_added = false;
+    if (s_bus_owned) {
+        (void)spi_bus_free(BSP_NAND_SPI_HOST);
+    }
+    s_bus_owned = false;
+}
 bool wt_cache_init(void)
 {
     if (s_init_done) return s_mounted;
@@ -75,14 +93,16 @@ bool wt_cache_init(void)
     device.queue_size = BSP_NAND_FLASH_DEFAULT_QUEUE_SIZE;
     device.flags = SPI_DEVICE_HALFDUPLEX;
     if (spi_bus_add_device(BSP_NAND_SPI_HOST, &device, &s_spi) != ESP_OK) {
-        ESP_LOGW(kTag, "NAND SPI 设备添加失败"); return false;
+        ESP_LOGW(kTag, "NAND SPI 设备添加失败");
+        nand_cleanup_partial(); return false;
     }
     s_device_added = true;
     spi_nand_flash_config_t nand = {};
     nand.device_handle = s_spi; nand.gc_factor = 0;
     nand.io_mode = SPI_NAND_IO_MODE_SIO; nand.flags = SPI_DEVICE_HALFDUPLEX;
     if (spi_nand_flash_init_with_layers(&nand, &s_blockdev) != ESP_OK) {
-        ESP_LOGW(kTag, "NAND 初始化失败"); s_blockdev = NULL; return false;
+        ESP_LOGW(kTag, "NAND 初始化失败"); s_blockdev = NULL;
+        nand_cleanup_partial(); return false;
     }
     esp_vfs_littlefs_conf_t mount = {};
     mount.base_path = kMountPath; mount.blockdev = s_blockdev;
@@ -91,7 +111,9 @@ bool wt_cache_init(void)
     mount.dont_mount = false; mount.grow_on_mount = false;
     if (esp_vfs_littlefs_register(&mount) != ESP_OK) {
         ESP_LOGW(kTag, "LittleFS 挂载失败（发音缓存禁用，仍可在线发音）");
-        s_blockdev = NULL; return false;
+        // register 失败时已消费并释放块设备；清掉 SPI 残留。
+        s_blockdev = NULL;
+        nand_cleanup_partial(); return false;
     }
     if (mkdir(kCacheRoot, 0777) != 0 && errno != EEXIST) {
         ESP_LOGW(kTag, "创建缓存目录失败: %s", strerror(errno)); return false;

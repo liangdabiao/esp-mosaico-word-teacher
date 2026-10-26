@@ -75,8 +75,12 @@ void app_main(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(app_orientation_start(ui));
     ESP_ERROR_CHECK(wt_controls_start(ui));
     ESP_ERROR_CHECK_WITHOUT_ABORT(wt_network_start());
-    ESP_ERROR_CHECK(wt_runtime_start(ui));
-    ESP_ERROR_CHECK(wt_ui_create(ui, &s_learning));
+    // 启动晚期失败只降级（显示/教师/语音部分可用），绝不 abort——
+    // abort 会触发 bootloader 对 ota_0 的未确认回滚，设备跌回 factory。
+    if (wt_runtime_start(ui) != ESP_OK)
+        ESP_LOGE(TAG, "runtime degraded: voice/teacher partially unavailable");
+    if (wt_ui_create(ui, &s_learning) != ESP_GSP_OK)
+        ESP_LOGE(TAG, "UI create failed; screen mirror stays for recovery");
 
     ESP_LOGI(TAG, "Word teacher ready at %dx%d RGB565",
              BSP_LCD_H_RES, BSP_LCD_V_RES);

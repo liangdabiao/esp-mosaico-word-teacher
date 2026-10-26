@@ -41,6 +41,8 @@ struct wt_model_t {
     wt_quiz_t quiz;
     unsigned quiz_score, quiz_total;
     bool reset_armed;
+    unsigned streak_cache;
+    bool resume_dirty;
 };
 static bool valid_utf8(const char *text,size_t capacity)
 {
@@ -109,9 +111,10 @@ static void present_word(wt_model_handle_t m)
 }
 static void save_resume(wt_model_handle_t m)
 {
+    // 只标脏：flash 写由 worker 经保存队列收口（渲染线程禁碰 NVS）。
     if(!m->blob)return;
     m->resume.book_index=m->book;m->resume.offset=m->offset;
-    wt_platform_resume_save(&m->resume);
+    m->resume_dirty=true;
 }
 static void load_word(wt_model_handle_t m,uint32_t offset)
 {
@@ -125,7 +128,9 @@ static void load_word(wt_model_handle_t m,uint32_t offset)
 static void fill_progress(wt_model_handle_t m)
 {
     wt_snapshot_t *v=&m->view;
-    v->streak=m->simulated?3:wt_platform_streak_touch();
+    // streak 由 worker 任务经 WT_MSG_STATUS 快照带上来（NVS 写含擦扇区，
+    // 不能在 12KB 渲染栈的 UI 任务里做）；这里只读快照。
+    v->streak=m->simulated?3:m->streak_cache;
     for(unsigned i=0;i<WT_BOOKS;++i){
         wt_book_t book;
         if(!m->blob||!wt_manifest_book_at(m->blob,i,&book)){v->prog_name[i][0]=0;v->prog_learned[i]=v->prog_total[i]=0;continue;}
@@ -205,7 +210,6 @@ static void mark_mastered(wt_model_handle_t m,uint32_t offset,bool mastered)
     if(!m->blob||!m->bits[m->book]||!wt_manifest_book_at(m->blob,m->book,&book))return;
     wt_progress_set(m->bits[m->book],book.count,offset,mastered);
     m->dirty[m->book]=true;
-    wt_platform_progress_save(book.key,m->bits[m->book],book.count);
 }
 wt_model_handle_t wt_model_create(bool simulated)
 {
@@ -232,6 +236,7 @@ wt_model_handle_t wt_model_create(bool simulated)
             wt_book_t book;
             if(wt_manifest_book_at(m->blob,m->book,&book)&&resume.offset<book.count)m->offset=resume.offset;
         }
+        fill_progress(m);
     }
     hint(m, simulated ? "模拟预览 · 不连接云端" : "选择一本词书开始学习");
     return m;
@@ -360,7 +365,7 @@ bool wt_model_action(wt_model_handle_t m, wt_action_t action, wt_command_t *out)
             wt_book_t book;
             if(m->bits[i]&&wt_manifest_book_at(m->blob,i,&book)){
                 wt_progress_clear(m->bits[i],book.count);
-                wt_platform_progress_save(book.key,m->bits[i],book.count);
+                m->dirty[i]=true;
             }
         }
         m->quiz_score=m->quiz_total=0;fill_progress(m);
@@ -492,6 +497,7 @@ void wt_model_message(wt_model_handle_t m, const wt_message_t *msg)
     if (msg->kind == WT_MSG_STATUS) {
         m->view.online = msg->online; m->view.configured = msg->configured;
         m->view.api_state=msg->online?msg->api_state:WT_API_UNKNOWN;
+        m->streak_cache=msg->streak;m->view.streak=msg->streak;
         if (msg->text[0]) hint(m, msg->text);
     } else {
         if (msg->generation != m->view.generation) return;
@@ -546,3 +552,21 @@ bool wt_model_tick(wt_model_handle_t m, unsigned elapsed, wt_command_t *out)
 }
 void wt_model_snapshot(wt_model_handle_t m, wt_snapshot_t *out)
 { if (m && out) *out = m->view; }
+bool wt_model_take_pending(wt_model_handle_t m, wt_save_msg_t *out)
+{
+    if(!m||!out||!m->blob)return false;
+    bool any=false;
+    memset(out,0,sizeof(*out));
+    out->resume_save=m->resume_dirty;
+    if(m->resume_dirty){out->resume=m->resume;m->resume_dirty=false;any=true;}
+    for(unsigned i=0;i<WT_BOOKS;++i){
+        wt_book_t book;
+        if(m->dirty[i]&&m->bits[i]&&wt_manifest_book_at(m->blob,i,&book)){
+            memcpy(out->bits,m->bits[i],wt_progress_bitmap_bytes(book.count));
+            snprintf(out->book_key,sizeof(out->book_key),"%s",book.key);
+            out->word_count=book.count;out->book_slot=i;
+            m->dirty[i]=false;any=true;break;   // 每次一本；UI tick 会再来取
+        }
+    }
+    return any;
+}

@@ -102,7 +102,7 @@
    "y": 102,
    "w": 432,
    "h": 62,
-   "text": "今天想学什么？",
+   "text": "",
    "font_size": 36,
    "fg_color": "#102632",
    "text_align": "center"
@@ -114,7 +114,7 @@
    "y": 422,
    "w": 432,
    "h": 26,
-   "text": "顶部下拉可调整亮度与声音",
+   "text": "",
    "font_size": 16,
    "fg_color": "#70818B",
    "text_align": "center"
@@ -2680,7 +2680,7 @@
    "y": 0,
    "w": 88,
    "h": 60,
-   "text": "",
+   "text": "‹ 返回",
    "font_size": 22,
    "fg_color": "#102632",
    "text_align": "center"
@@ -2971,7 +2971,7 @@
    "y": 0,
    "w": 88,
    "h": 60,
-   "text": "",
+   "text": "‹ 返回",
    "font_size": 22,
    "fg_color": "#102632",
    "text_align": "center"
@@ -3201,7 +3201,7 @@
    "y": 0,
    "w": 88,
    "h": 60,
-   "text": "",
+   "text": "‹ 返回",
    "font_size": 22,
    "fg_color": "#102632",
    "text_align": "center"
