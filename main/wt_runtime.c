@@ -146,8 +146,23 @@ static void speak_word(struct runtime_t *r,const wt_command_t *c,bool sentence)
     if(!wt_voice_ready()){publish(r,WT_MSG_SPEECH_DONE,c->generation,"扬声器未就绪");return;}
     wt_controls_t controls;wt_platform_controls_get(&controls);
     wt_voice_apply_volume((int)controls.volume);
-    esp_err_t err=sentence?wt_voice_speak_sentence(c->text):wt_voice_speak_word(c->text);
-    ESP_LOGI("wt_voice","%s playback: result=%s",sentence?"Sentence":"Word",esp_err_to_name(err));
+    // 例句整句：有道 type=2 服务端 500、百度 gettts 的 TLS 证书不被设备信任
+    //（本网络实测 100% 失败）——整句统一走 DashScope qwen3-tts（keep-alive 常驻
+    // 连接，问老师朗读同通路）；单词仍走有道 HTTP + NAND 缓存。
+    if(sentence){
+        const wt_config_t *config=wt_network_config();
+        if(!config||!wt_network_online()){publish(r,WT_MSG_SPEECH_DONE,c->generation,"例句需要联网");return;}
+        uint8_t *wav=NULL;size_t size=0;
+        esp_err_t err=wt_provider_audio(r->provider,config,c->generation,c->text,&wav,&size);
+        if(err==ESP_OK)err=play(r,c->generation,wav,size);
+        free(wav);
+        ESP_LOGI("wt_voice","Sentence(DashScope) playback: result=%s",esp_err_to_name(err));
+        if(current(r,c->generation))publish(r,WT_MSG_SPEECH_DONE,c->generation,
+            err==ESP_OK||err==ESP_ERR_INVALID_STATE?NULL:"例句发音失败，请检查网络后重试");
+        return;
+    }
+    esp_err_t err=wt_voice_speak_word(c->text);
+    ESP_LOGI("wt_voice","Word playback: result=%s",esp_err_to_name(err));
     if(current(r,c->generation))publish(r,WT_MSG_SPEECH_DONE,c->generation,
         err==ESP_OK||err==ESP_ERR_INVALID_STATE?NULL:
         err==ESP_ERR_NOT_FOUND?"没有找到这个词的发音":"发音失败，请检查网络后重试");

@@ -185,7 +185,7 @@ esp_err_t wt_voice_build_url(bool sentence, const char *text, char *out, size_t 
     int n = snprintf(out, cap, "%s%s", base, encoded);
     return n < 0 || (size_t)n >= cap ? ESP_ERR_INVALID_SIZE : ESP_OK;
 }
-struct outcome { bool ok, cancelled; uint32_t bytes, pcm_bytes; const char *detail; };
+struct outcome { bool ok, cancelled; uint32_t bytes, pcm_bytes, dfail, wfail; const char *detail; };
 // 主循环：读 → 剥 ID3 → 解码 → 混单声道 → 升采 → 写 I2S，边播边喂缓存 writer。
 // cache_source 非空 = 缓存回放（client 为 NULL）；否则走网络。
 static struct outcome stream_and_play(esp_http_client_handle_t client,
@@ -193,7 +193,7 @@ static struct outcome stream_and_play(esp_http_client_handle_t client,
                                       uint32_t generation, FILE *cache_source,
                                       bool cache_write)
 {
-    struct outcome o = {false, false, 0, 0, "unknown"};
+    struct outcome o = {false, false, 0, 0, 0, 0, "unknown"};
     bool format_ready = false, upsample = false, played = false, read_ended = false;
     uint8_t channels = 1;
     uint32_t sample_rate = 0;
@@ -262,13 +262,28 @@ static struct outcome stream_and_play(esp_http_client_handle_t client,
             esp_audio_dec_info_t dec_info = {};
             const esp_audio_err_t result = esp_mp3_dec_decode(decoder, &raw, &frame, &dec_info);
             if (result == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) { o.detail = "decoder-buffer"; return o; }
+            if (result == ESP_AUDIO_ERR_DATA_LACK) {
+                // 数据不足以解出完整帧（帧尾残片）：保留缓冲，外层继续读入
+                // 更多数据后重试——绝不丢弃残片，否则 MP3 流失步、声音缺失。
+                ++decode_failures; o.dfail = decode_failures;
+                if (decode_failures > 32) { o.detail = "data-lack"; return o; }
+                break;
+            }
             if (result != ESP_AUDIO_ERR_OK) {
-                // 偶发坏帧放弃这一批重新同步；坏帧太多说明流本身不对。
-                if (++decode_failures > 32) { o.detail = "decode"; return o; }
+                // 真坏帧：放弃这一批重新同步；坏帧太多说明流本身不对。
+                ++decode_failures; o.dfail = decode_failures;
+                if (decode_failures <= 3)
+                    ESP_LOGW(kTag, "解码失败#%u err=%d 已收%u字节 缓冲余%u",
+                        decode_failures, (int)result, (unsigned)o.bytes, (unsigned)raw.len);
+                if (decode_failures > 32) { o.detail = "decode"; return o; }
                 raw.len = 0; break;
             }
             if (raw.consumed > raw.len) raw.consumed = raw.len;
             raw.buffer += raw.consumed; raw.len -= raw.consumed;
+            if (raw.consumed == 0) {
+                // 解码器在等更多输入：保留缓冲，回到外层继续读。
+                break;
+            }
             if (frame.decoded_size > 0) {
                 if (!format_ready && dec_info.sample_rate) {
                     channels = dec_info.channel < 1 ? 1 :
@@ -301,7 +316,8 @@ static struct outcome stream_and_play(esp_http_client_handle_t client,
                     }
                     if (!audio_write(play, play_bytes)) {
                         // 写失败必须留痕：真机上"状态在播、喇叭没声"最难查。
-                        if ((++write_failures & 0x07u) == 1)
+                        ++write_failures; o.wfail = write_failures;
+                        if ((write_failures & 0x07u) == 1)
                             ESP_LOGW(kTag, "写 I2S 失败 %u 次（本次 %u 字节）",
                                 write_failures, (unsigned)play_bytes);
                         continue;
@@ -310,7 +326,7 @@ static struct outcome stream_and_play(esp_http_client_handle_t client,
                     last_progress = now_ms();
                     if (!played) {
                         played = true;
-                        ESP_LOGI(kTag, "首帧 PCM 已写入 I2S（%u 字节）", (unsigned)play_bytes);
+                                        ESP_LOGI(kTag, "首帧 PCM 已写入 I2S（%u 字节）", (unsigned)play_bytes);
                     }
                 }
             }
@@ -410,8 +426,8 @@ static esp_err_t play_key_once(const char *key, const char *url)
     if (o.ok && cache_write) wt_cache_writer_commit();
     else wt_cache_writer_abort();
     if (client) { esp_http_client_close(client); esp_http_client_cleanup(client); }
-    ESP_LOGI(kTag, "播放完成: ok=%u bytes=%u pcm=%u detail=%s",
-        o.ok, o.bytes, o.pcm_bytes, o.detail);
+    ESP_LOGI(kTag, "播放完成: ok=%u bytes=%u pcm=%u dfail=%u wfail=%u detail=%s",
+        o.ok, o.bytes, o.pcm_bytes, o.dfail, o.wfail, o.detail);
     return o.ok || o.cancelled ? ESP_OK : ESP_FAIL;
 }
 // 弱网（读超时/连接抖动）自动重试一次；GET 下载体积小，重发无害。
